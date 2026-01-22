@@ -341,8 +341,7 @@ def main_loop():
                             del price_hist[ticker]
                         if ticker in entry_times:
                             del entry_times[ticker]
-                        if position_key in known_positions:
-                            del known_positions[position_key]
+                        # Don't delete from known_positions — keeps it from logging as "new" again
                         continue
                     
                     # Get sparkline
