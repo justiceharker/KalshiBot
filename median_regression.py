@@ -3,7 +3,7 @@ import os
 import csv
 import datetime
 from collections import deque
-from statistics import median
+from statistics import median, stdev
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
@@ -21,9 +21,28 @@ PAPER_TRADING = os.getenv("PAPER_TRADING", "false").lower() in ("1", "true", "ye
 
 # Strategy parameters
 ROLLING_WINDOW = int(os.getenv("MR_WINDOW", "15"))
-DEVIATION_THRESHOLD_PCT = float(os.getenv("MR_THRESHOLD", "5.0"))  # percent
+DEVIATION_THRESHOLD_PCT = float(os.getenv("MR_THRESHOLD", "5.0"))  # percent (base)
 MAX_HOLD_SECONDS = int(os.getenv("MR_MAX_HOLD", str(60 * 60)))  # 1 hour
 REFRESH_RATE = float(os.getenv("MR_REFRESH", "2"))
+
+# Liquidity filtering parameters
+MIN_OPEN_INTEREST = int(os.getenv("MIN_OPEN_INTEREST", "100"))  # min shares
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "2.0"))  # max spread %
+MIN_VOLUME = int(os.getenv("MIN_VOLUME", "10"))  # min shares in last period
+
+# Dynamic position sizing
+POSITION_SIZING_ENABLED = os.getenv("POSITION_SIZING", "true").lower() in ("1", "true", "yes")
+BASE_POSITION_SIZE = int(os.getenv("BASE_POSITION_SIZE", "1"))  # shares to buy
+MAX_POSITION_SIZE = int(os.getenv("MAX_POSITION_SIZE", "10"))  # max shares
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))  # % of account per trade
+
+# Volatility-based threshold
+VOLATILITY_THRESHOLD_ENABLED = os.getenv("VOLATILITY_THRESHOLD", "true").lower() in ("1", "true", "yes")
+BASE_DEVIATION_THRESHOLD = float(os.getenv("MR_THRESHOLD", "5.0"))
+VOLATILITY_MULTIPLIER = float(os.getenv("VOLATILITY_MULTIPLIER", "1.0"))  # adjust threshold by volatility
+
+# Entry logic parameters
+HOURS_BEFORE_CLOSE = int(os.getenv("HOURS_BEFORE_CLOSE", "2"))  # don't enter this close to close
 
 # Safety parameters
 MIN_HOLD_TIME = 30
@@ -110,6 +129,101 @@ def get_stats():
                 continue
     win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
     return total_pnl, win_rate
+
+
+def is_market_liquid(market, yes_bid, yes_ask):
+    """Check if market meets liquidity requirements."""
+    try:
+        open_interest = int(getattr(market, 'open_interest', 0) or 0)
+        if open_interest < MIN_OPEN_INTEREST:
+            return False
+        
+        # Check spread %
+        if yes_bid > 0 and yes_ask > 0:
+            spread_pct = abs(yes_ask - yes_bid) / yes_bid * 100
+            if spread_pct > MAX_SPREAD_PCT:
+                return False
+        
+        return True
+    except:
+        return False
+
+
+def is_market_active_for_entry(market):
+    """Check if market is suitable for new entries (not too close to close)."""
+    try:
+        # Check if market has a close time
+        close_time_str = getattr(market, 'close_time', None)
+        if not close_time_str:
+            return True
+        
+        # Parse close time (ISO format)
+        close_time = datetime.datetime.fromisoformat(close_time_str.replace('Z', '+00:00'))
+        now = datetime.datetime.now(datetime.timezone.utc)
+        time_to_close = (close_time - now).total_seconds() / 3600  # hours
+        
+        # Don't enter if too close to close
+        if time_to_close < HOURS_BEFORE_CLOSE:
+            return False
+        
+        return True
+    except:
+        return True  # If we can't determine, allow entry
+
+
+def calculate_dynamic_threshold(prices):
+    """Calculate volatility-based threshold adjustment."""
+    if not VOLATILITY_THRESHOLD_ENABLED or len(prices) < 3:
+        return DEVIATION_THRESHOLD_PCT
+    
+    try:
+        # Calculate coefficient of variation (volatility)
+        price_list = list(prices)
+        if len(price_list) < 3:
+            return DEVIATION_THRESHOLD_PCT
+        
+        mean_price = sum(price_list) / len(price_list)
+        volatility = stdev(price_list) / mean_price if mean_price > 0 else 0
+        
+        # Adjust threshold: higher volatility = higher threshold needed
+        # Map volatility to threshold adjustment (e.g., vol 0.05 = 5% adjustment)
+        volatility_pct = volatility * 100
+        adjusted_threshold = BASE_DEVIATION_THRESHOLD * (1 + (volatility_pct / 100) * VOLATILITY_MULTIPLIER)
+        
+        return adjusted_threshold
+    except:
+        return DEVIATION_THRESHOLD_PCT
+
+
+def get_account_balance():
+    """Get account balance for dynamic position sizing."""
+    try:
+        if client is None:
+            return 1000  # default fallback
+        
+        resp = client.get_portfolio()
+        balance = float(getattr(resp, 'cash_balance', 0) or 0)
+        return balance / 100 if balance > 100 else balance  # convert cents to dollars if needed
+    except:
+        return 1000  # fallback
+
+
+def calculate_position_size(balance, volatility=0.0):
+    """Calculate position size based on account balance and volatility."""
+    if not POSITION_SIZING_ENABLED:
+        return BASE_POSITION_SIZE
+    
+    try:
+        # Risk-based sizing: (balance * risk_percent) / entry_price
+        risk_amount = balance * (RISK_PERCENT / 100)
+        
+        # Volatility adjustment: higher volatility = smaller position
+        volatility_adjustment = 1.0 / (1.0 + volatility * 2) if volatility > 0 else 1.0
+        
+        position_size = max(1, min(int(BASE_POSITION_SIZE * volatility_adjustment), MAX_POSITION_SIZE))
+        return position_size
+    except:
+        return BASE_POSITION_SIZE
 
 
 def log_trade(ticker, title, entry, exit_price, pnl_pct, reason):
@@ -288,9 +402,14 @@ def main_loop():
                     ticker = getattr(pos, 'ticker', getattr(pos, 'event_ticker', 'Unknown'))
                     market = client.get_market(ticker).market
                     current = float(market.yes_bid_dollars)
+                    yes_ask = float(getattr(market, 'yes_ask_dollars', current))
                     cost = getattr(pos, 'market_exposure', getattr(pos, 'total_cost', 0))
                     entry = (cost / shares / 100) if shares > 0 else 0  # cost is in cents
-
+                    
+                    # Market liquidity filter
+                    if not is_market_liquid(market, current, yes_ask):
+                        continue
+                    
                     # Initialize tracking
                     if ticker not in price_hist:
                         price_hist[ticker] = deque(maxlen=ROLLING_WINDOW)
@@ -302,6 +421,10 @@ def main_loop():
                     # Update price history
                     price_hist[ticker].append(current)
                     med = median(list(price_hist[ticker])) if len(price_hist[ticker]) >= 3 else current
+                    
+                    # Calculate dynamic threshold based on volatility
+                    dynamic_threshold = calculate_dynamic_threshold(list(price_hist[ticker]))
+                    
                     dev_pct = (current - med) / med * 100 if med != 0 else 0.0
                     pnl = ((current - entry) / entry * 100) if entry > 0 else 0.0
                     hold_sec = now - entry_times[ticker]
@@ -314,14 +437,18 @@ def main_loop():
                     # Log new position
                     position_key = f"{ticker}_{shares}"
                     if position_key not in known_positions:
-                        known_positions[position_key] = True
-                        log_new_position(ticker, market.title, entry, shares)
+                        # Check if market is active for new entries
+                        if is_market_active_for_entry(market):
+                            known_positions[position_key] = True
+                            log_new_position(ticker, market.title, entry, shares)
+                        else:
+                            continue  # Skip this position if too close to market close
                     
                     # Median reversion sell logic
                     sold = False
                     reason = None
-                    if position_key not in sold_positions and dev_pct >= DEVIATION_THRESHOLD_PCT and pnl > 0:
-                        reason = f"Median reversion +{DEVIATION_THRESHOLD_PCT}% deviation"
+                    if position_key not in sold_positions and dev_pct >= dynamic_threshold and pnl > 0:
+                        reason = f"Median reversion +{dynamic_threshold:.2f}% deviation"
                         if execute_order(ticker, shares, reason, action="sell"):
                             log_trade(ticker, market.title, entry, current, pnl, reason)
                             sold_positions.add(position_key)
