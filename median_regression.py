@@ -220,21 +220,21 @@ def generate_dashboard(rows):
         title_style="bold white on blue",
         border_style="bright_blue",
         header_style="bold cyan",
-        show_lines=True,
-        expand=True,
+        show_lines=False,
+        expand=False,
         padding=(0, 1)
     )
     
-    table.add_column("Market", style="bold cyan", width=25)
-    table.add_column("Entry", justify="right", style="white")
-    table.add_column("Median", justify="right", style="white")
-    table.add_column("Now", justify="right", style="bold white")
-    table.add_column("Peak", justify="right", style="dim cyan")
-    table.add_column("Dev%", justify="right")
-    table.add_column("Chart", justify="center", width=15)
-    table.add_column("PnL%", justify="right", width=10)
-    table.add_column("Hold", justify="right")
-    table.add_column("Status", justify="center", width=18)
+    table.add_column("Market", style="bold cyan", width=22)
+    table.add_column("Entry", justify="right", style="white", width=8)
+    table.add_column("Median", justify="right", style="white", width=8)
+    table.add_column("Now", justify="right", style="bold white", width=8)
+    table.add_column("Peak", justify="right", style="dim cyan", width=8)
+    table.add_column("Dev%", justify="right", width=7)
+    table.add_column("Chart", justify="center", width=12)
+    table.add_column("PnL%", justify="right", width=8)
+    table.add_column("Hold", justify="right", width=6)
+    table.add_column("Status", justify="center", width=16)
     
     for r in rows:
         pnl_color = "bold green" if r['pnl'] >= 10 else ("green" if r['pnl'] > 0 else "red")
@@ -289,7 +289,7 @@ def main_loop():
                     market = client.get_market(ticker).market
                     current = float(market.yes_bid_dollars)
                     cost = getattr(pos, 'market_exposure', getattr(pos, 'total_cost', 0))
-                    entry = (cost / shares) / 100 if cost > 100 else (cost / shares)
+                    entry = (cost / shares / 100) if shares > 0 else 0  # cost is in cents
 
                     # Initialize tracking
                     if ticker not in price_hist:
