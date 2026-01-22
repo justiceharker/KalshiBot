@@ -4,10 +4,14 @@ import csv
 import datetime
 from collections import deque
 from statistics import median
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.live import Live
 from rich.table import Table
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configuration via environment variables (safer than hardcoding)
 KEY_ID = os.getenv("KALSHI_KEY_ID")
