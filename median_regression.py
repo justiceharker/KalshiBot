@@ -28,18 +28,6 @@ REFRESH_RATE = float(os.getenv("MR_REFRESH", "2"))
 # Liquidity filtering parameters
 MIN_OPEN_INTEREST = int(os.getenv("MIN_OPEN_INTEREST", "100"))  # min shares
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "2.0"))  # max spread %
-MIN_VOLUME = int(os.getenv("MIN_VOLUME", "10"))  # min shares in last period
-
-# Dynamic position sizing
-POSITION_SIZING_ENABLED = os.getenv("POSITION_SIZING", "true").lower() in ("1", "true", "yes")
-BASE_POSITION_SIZE = int(os.getenv("BASE_POSITION_SIZE", "1"))  # shares to buy
-MAX_POSITION_SIZE = int(os.getenv("MAX_POSITION_SIZE", "10"))  # max shares
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))  # % of account per trade
-
-# Volatility-based threshold
-VOLATILITY_THRESHOLD_ENABLED = os.getenv("VOLATILITY_THRESHOLD", "true").lower() in ("1", "true", "yes")
-BASE_DEVIATION_THRESHOLD = float(os.getenv("MR_THRESHOLD", "5.0"))
-VOLATILITY_MULTIPLIER = float(os.getenv("VOLATILITY_MULTIPLIER", "1.0"))  # adjust threshold by volatility
 
 # Entry logic parameters
 HOURS_BEFORE_CLOSE = int(os.getenv("HOURS_BEFORE_CLOSE", "2"))  # don't enter this close to close
@@ -75,8 +63,6 @@ def listen_for_input():
                     key = msvcrt.getch().decode('utf-8').lower()
                     if key == 's':
                         manual_sell_requested = True
-                        with open("input_log.txt", "a") as f:
-                            f.write(f"{datetime.datetime.now()} - Manual sell requested\n")
                         console.print("[yellow]🔔 Manual sell requested for all positions[/yellow]")
                     elif key == 'c':
                         # Cancel all open orders
@@ -87,15 +73,11 @@ def listen_for_input():
                             if order_id and cancel_order(order_id):
                                 canceled += 1
                         console.print(f"[yellow]❌ Canceled {canceled}/{len(open_orders)} orders[/yellow]")
-                        with open("input_log.txt", "a") as f:
-                            f.write(f"{datetime.datetime.now()} - Canceled {canceled} orders\n")
                     elif key == 'q':
                         console.print("[yellow]Exiting...[/yellow]")
                         break
                 time.sleep(0.1)
             except Exception as e:
-                with open("input_log.txt", "a") as f:
-                    f.write(f"{datetime.datetime.now()} - Error in listen_for_input: {e}\n")
                 time.sleep(0.1)
     else:
         # Unix/Linux approach
@@ -135,16 +117,6 @@ try:
     console.print("[green]✓ Kalshi client initialized[/green]")
 except Exception as e:
     console.print(f"[yellow]Warning: Kalshi client not configured: {e}[/yellow]")
-
-
-def get_sport_info(ticker):
-    """Assigns icons based on ticker strings."""
-    t = ticker.upper()
-    icons = {"NBA": "🏀", "NHL": "🏒", "SOC": "⚽", "TEN": "🎾", "NFL": "🏈", "MLB": "⚾", "POL": "🏛️"}
-    for key, icon in icons.items():
-        if key in t: 
-            return icon
-    return "💰"
 
 
 def get_sparkline(prices):
@@ -240,57 +212,23 @@ def is_market_active_for_entry(market):
 
 def calculate_dynamic_threshold(prices):
     """Calculate volatility-based threshold adjustment."""
-    if not VOLATILITY_THRESHOLD_ENABLED or len(prices) < 3:
+    if len(prices) < 3:
         return DEVIATION_THRESHOLD_PCT
     
     try:
         # Calculate coefficient of variation (volatility)
         price_list = list(prices)
-        if len(price_list) < 3:
-            return DEVIATION_THRESHOLD_PCT
         
         mean_price = sum(price_list) / len(price_list)
         volatility = stdev(price_list) / mean_price if mean_price > 0 else 0
         
         # Adjust threshold: higher volatility = higher threshold needed
-        # Map volatility to threshold adjustment (e.g., vol 0.05 = 5% adjustment)
         volatility_pct = volatility * 100
-        adjusted_threshold = BASE_DEVIATION_THRESHOLD * (1 + (volatility_pct / 100) * VOLATILITY_MULTIPLIER)
+        adjusted_threshold = DEVIATION_THRESHOLD_PCT * (1 + (volatility_pct / 100) * 1.0)
         
         return adjusted_threshold
     except:
         return DEVIATION_THRESHOLD_PCT
-
-
-def get_account_balance():
-    """Get account balance for dynamic position sizing."""
-    try:
-        if client is None:
-            return 1000  # default fallback
-        
-        resp = client.get_portfolio()
-        balance = float(getattr(resp, 'cash_balance', 0) or 0)
-        return balance / 100 if balance > 100 else balance  # convert cents to dollars if needed
-    except:
-        return 1000  # fallback
-
-
-def calculate_position_size(balance, volatility=0.0):
-    """Calculate position size based on account balance and volatility."""
-    if not POSITION_SIZING_ENABLED:
-        return BASE_POSITION_SIZE
-    
-    try:
-        # Risk-based sizing: (balance * risk_percent) / entry_price
-        risk_amount = balance * (RISK_PERCENT / 100)
-        
-        # Volatility adjustment: higher volatility = smaller position
-        volatility_adjustment = 1.0 / (1.0 + volatility * 2) if volatility > 0 else 1.0
-        
-        position_size = max(1, min(int(BASE_POSITION_SIZE * volatility_adjustment), MAX_POSITION_SIZE))
-        return position_size
-    except:
-        return BASE_POSITION_SIZE
 
 
 def log_trade(ticker, title, entry, exit_price, pnl_pct, reason):
