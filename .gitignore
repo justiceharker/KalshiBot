@@ -18,6 +18,16 @@ ENV/
 trading_log.csv
 simulated_trades.csv
 
+# Test and debug files
+test_*.py
+debug_*.py
+check_*.py
+quick_*.py
+simple_*.py
+close_*.py
+debug_output.txt
+input_log.txt
+
 # Secrets and credentials
 kalshi_key.pem
 .env
