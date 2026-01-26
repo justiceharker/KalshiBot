@@ -2,6 +2,7 @@ import time
 import os
 import csv
 import datetime
+import threading
 from collections import deque
 from statistics import median, stdev
 from dotenv import load_dotenv
@@ -17,7 +18,6 @@ load_dotenv()
 KEY_ID = os.getenv("KALSHI_KEY_ID")
 PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "kalshi_key.pem")
 LOG_FILE = os.getenv("KALSHI_LOG_FILE", "trading_log.csv")
-PAPER_TRADING = os.getenv("PAPER_TRADING", "false").lower() in ("1", "true", "yes")
 
 # Strategy parameters
 ROLLING_WINDOW = int(os.getenv("MR_WINDOW", "15"))
@@ -53,6 +53,73 @@ TIME_BASED_STOP_LOSS = 2700  # 45 min
 BREAK_EVEN_TIMER = 1800      # 30 min
 
 console = Console()
+
+# Global flag for manual sell trigger
+manual_sell_requested = False
+manual_sell_ticker = None
+
+def listen_for_input():
+    """Listen for keyboard commands: 's' to sell, 'c' to cancel orders, 'q' to quit."""
+    global manual_sell_requested, manual_sell_ticker
+    import sys
+    import select
+    
+    console.print("[dim]💡 Keyboard shortcuts: 's'=sell all, 'c'=cancel orders, 'q'=quit[/dim]")
+    
+    # On Windows, use a simpler approach
+    if sys.platform == 'win32':
+        import msvcrt
+        while True:
+            try:
+                if msvcrt.kbhit():
+                    key = msvcrt.getch().decode('utf-8').lower()
+                    if key == 's':
+                        manual_sell_requested = True
+                        with open("input_log.txt", "a") as f:
+                            f.write(f"{datetime.datetime.now()} - Manual sell requested\n")
+                        console.print("[yellow]🔔 Manual sell requested for all positions[/yellow]")
+                    elif key == 'c':
+                        # Cancel all open orders
+                        open_orders = get_all_open_orders()
+                        canceled = 0
+                        for order in open_orders:
+                            order_id = getattr(order, 'order_id', None)
+                            if order_id and cancel_order(order_id):
+                                canceled += 1
+                        console.print(f"[yellow]❌ Canceled {canceled}/{len(open_orders)} orders[/yellow]")
+                        with open("input_log.txt", "a") as f:
+                            f.write(f"{datetime.datetime.now()} - Canceled {canceled} orders\n")
+                    elif key == 'q':
+                        console.print("[yellow]Exiting...[/yellow]")
+                        break
+                time.sleep(0.1)
+            except Exception as e:
+                with open("input_log.txt", "a") as f:
+                    f.write(f"{datetime.datetime.now()} - Error in listen_for_input: {e}\n")
+                time.sleep(0.1)
+    else:
+        # Unix/Linux approach
+        while True:
+            try:
+                user_input = input().strip().lower()
+                if user_input == 's':
+                    manual_sell_requested = True
+                    console.print("[yellow]🔔 Manual sell requested for all positions[/yellow]")
+                elif user_input == 'c':
+                    open_orders = get_all_open_orders()
+                    canceled = 0
+                    for order in open_orders:
+                        order_id = getattr(order, 'order_id', None)
+                        if order_id and cancel_order(order_id):
+                            canceled += 1
+                    console.print(f"[yellow]❌ Canceled {canceled}/{len(open_orders)} orders[/yellow]")
+                elif user_input == 'q':
+                    console.print("[yellow]Exiting...[/yellow]")
+                    break
+            except EOFError:
+                break
+            except:
+                time.sleep(0.1)
 
 # Try to initialize Kalshi client if available; remain tolerant if not running live
 client = None
@@ -232,10 +299,9 @@ def log_trade(ticker, title, entry, exit_price, pnl_pct, reason):
     with open(LOG_FILE, mode="a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["Timestamp", "Ticker", "Event", "Entry", "Exit", "PnL%", "Reason", "Mode"])
+            writer.writerow(["Timestamp", "Ticker", "Event", "Entry", "Exit", "PnL%", "Reason"])
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
-        mode = "SIMULATED" if PAPER_TRADING else "LIVE"
-        writer.writerow([timestamp, ticker, title, f"${entry:.2f}", f"${exit_price:.2f}", f"{pnl_pct:.1f}%", reason, mode])
+        writer.writerow([timestamp, ticker, title, f"${entry:.2f}", f"${exit_price:.2f}", f"{pnl_pct:.1f}%", reason])
 
 
 def log_new_position(ticker, title, entry, shares):
@@ -244,10 +310,9 @@ def log_new_position(ticker, title, entry, shares):
     with open(LOG_FILE, mode="a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["Timestamp", "Ticker", "Event", "Entry", "Exit", "PnL%", "Reason", "Mode"])
+            writer.writerow(["Timestamp", "Ticker", "Event", "Entry", "Exit", "PnL%", "Reason"])
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
-        mode = "SIMULATED" if PAPER_TRADING else "LIVE"
-        writer.writerow([timestamp, ticker, title, f"${entry:.2f}", "---", "0.0%", f"NEW POSITION ({shares} shares)", mode])
+        writer.writerow([timestamp, ticker, title, f"${entry:.2f}", "---", "0.0%", f"NEW POSITION ({shares} shares)"])
     
     console.print(f"\n[bold green]🎉 NEW POSITION DETECTED![/bold green]")
     console.print(f"[cyan]📊 {title}[/cyan]")
@@ -256,16 +321,68 @@ def log_new_position(ticker, title, entry, shares):
 
 
 def execute_order(ticker, shares, reason, action="sell"):
-    """Executes or simulates order based on PAPER_TRADING mode."""
-    if PAPER_TRADING or client is None:
-        console.print(f"[yellow]📝 SIMULATED {action.upper()} {ticker} {shares} — {reason}[/yellow]")
-        return True
+    """Executes live order for trading with robust parameters.
+    
+    For CLOSING positions:
+    - Long (positive shares): Sell YES at bid price
+    - Short (negative shares): Buy YES at ask price
+    
+    For OPENING positions:
+    - Buy: Buy YES at ask price
+    - Sell/Short: Sell YES at bid price (creates short)
+    """
+    if client is None:
+        console.print(f"[red]❌ No Kalshi client available[/red]")
+        return False
     try:
-        client.create_order(ticker=ticker, action=action, count=shares, type="market", side="yes")
-        console.print(f"[green]✅ LIVE {action.upper()} {ticker} {shares} — {reason}[/green]")
+        # Get market data
+        market = client.get_market(ticker).market
+        
+        if action == "sell":
+            # Sell YES shares at the bid price
+            yes_price = market.yes_bid_dollars
+            
+            order = client.create_order(
+                ticker=ticker,
+                side="yes",
+                action="sell",
+                count=shares,
+                type="limit",
+                yes_price_dollars=yes_price
+            )
+            action_str = "SELL"
+        else:
+            # Buy YES shares at the ask price
+            yes_price = market.yes_ask_dollars
+            
+            order = client.create_order(
+                ticker=ticker,
+                side="yes",
+                action="buy",
+                count=shares,
+                type="limit",
+                yes_price_dollars=yes_price
+            )
+            action_str = "BUY"
+        
+        # Log successful order
+        order_id = getattr(order, 'order_id', 'UNKNOWN')
+        console.print(f"[green]✅ LIVE {action_str} {ticker} {shares} @ ${yes_price} — {reason}[/green]")
+        
+        # Log to file
+        with open("successful_orders.log", "a") as f:
+            f.write(f"{datetime.datetime.now()} - Order ID: {order_id}, Ticker: {ticker}, Shares: {shares}, Action: {action_str}, Reason: {reason}\n")
+        
         return True
     except Exception as e:
-        console.print(f"[red]❌ Order failed: {e}[/red]")
+        # Log error silently to avoid spamming console
+        import traceback
+        error_msg = str(e)
+        with open("order_errors.log", "a") as f:
+            f.write(f"{datetime.datetime.now()} - Ticker: {ticker}, Action: {reason}\n")
+            f.write(f"Error: {error_msg}\n")
+            f.write(traceback.format_exc() + "\n\n")
+        # Don't print to console to avoid disrupting Live display
         return False
 
 
@@ -273,6 +390,40 @@ def calculate_stop_loss(entry, current_bid):
     """Calculate stop loss with percentage and floor."""
     percent_stop = entry * (1 - STOP_LOSS_PERCENT)
     return max(percent_stop, STOP_LOSS_FLOOR)
+
+
+def get_account_balance():
+    """Fetch account balance from Kalshi."""
+    try:
+        if client is None:
+            return None
+        portfolio = client.get_portfolio()
+        balance_cents = getattr(portfolio, 'cash_balance', 0)
+        return float(balance_cents) / 100  # Convert cents to dollars
+    except:
+        return None
+
+
+def get_all_open_orders():
+    """Fetch all open orders."""
+    try:
+        if client is None:
+            return []
+        resp = client.get_orders(status="open")
+        return getattr(resp, 'orders', [])
+    except:
+        return []
+
+
+def cancel_order(order_id):
+    """Cancel an open order by ID."""
+    try:
+        if client is None:
+            return False
+        client.delete_order(order_id=order_id)
+        return True
+    except:
+        return False
 
 
 def should_execute_stop(ticker, current_bid, entry, hold_time):
@@ -305,6 +456,8 @@ def should_execute_stop(ticker, current_bid, entry, hold_time):
 def generate_dashboard(rows):
     """Creates a detailed Rich Table dashboard with statistics."""
     all_pnl, win_rate = get_stats()
+    account_balance = get_account_balance()
+    open_orders = get_all_open_orders()
     
     # Dynamic color based on performance
     if all_pnl >= 20:
@@ -323,11 +476,15 @@ def generate_dashboard(rows):
         p_color = "red"
         perf_emoji = "🔻"
     
-    mode_indicator = "[yellow bold]📝 PAPER TRADING[/yellow bold]" if PAPER_TRADING else "[cyan bold]⚡ LIVE MODE[/cyan bold]"
+    mode_indicator = "[cyan bold]⚡ LIVE MODE[/cyan bold]"
     total_trades = len(rows)
     profitable = sum(1 for r in rows if r['pnl'] > 0)
     
-    stats_header = f"{mode_indicator}  |  {perf_emoji} PnL: [{p_color}]{all_pnl:+.1f}%[/{p_color}]  |  Win Rate: [cyan]{win_rate:.1f}%[/cyan]  |  Positions: [green]{profitable}[/green]/[dim]{total_trades}[/dim]"
+    # Build header with account info
+    balance_str = f"Balance: ${account_balance:.2f}" if account_balance else "Balance: N/A"
+    orders_str = f"Open Orders: {len(open_orders)}"
+    
+    stats_header = f"{mode_indicator}  |  {perf_emoji} PnL: [{p_color}]{all_pnl:+.1f}%[/{p_color}]  |  Win Rate: [cyan]{win_rate:.1f}%[/cyan]  |  Positions: [green]{profitable}[/green]/[dim]{total_trades}[/dim]  |  {balance_str}  |  {orders_str}"
     
     table = Table(
         title="📊 MEDIAN REGRESSION BOT 📊",
@@ -339,15 +496,15 @@ def generate_dashboard(rows):
         padding=(0, 1)
     )
     
-    table.add_column("Market", style="bold cyan", width=22)
-    table.add_column("Entry", justify="right", style="white", width=8)
-    table.add_column("Median", justify="right", style="white", width=8)
-    table.add_column("Now", justify="right", style="bold white", width=8)
-    table.add_column("Peak", justify="right", style="dim cyan", width=8)
-    table.add_column("Dev%", justify="right", width=7)
-    table.add_column("Chart", justify="center", width=12)
-    table.add_column("PnL%", justify="right", width=8)
-    table.add_column("Hold", justify="right", width=6)
+    table.add_column("Market", style="bold cyan", width=20)
+    table.add_column("Entry", justify="right", style="white", width=9)
+    table.add_column("Median", justify="right", style="white", width=9)
+    table.add_column("Now", justify="right", style="bold white", width=9)
+    table.add_column("Peak", justify="right", style="dim cyan", width=9)
+    table.add_column("Dev%", justify="right", width=8)
+    table.add_column("Chart", justify="center", width=14)
+    table.add_column("PnL%", justify="right", width=9)
+    table.add_column("Hold", justify="right", width=7)
     table.add_column("Status", justify="center", width=16)
     
     for r in rows:
@@ -374,6 +531,7 @@ def generate_dashboard(rows):
 
 def main_loop():
     """Main trading loop with robust position tracking."""
+    global manual_sell_requested, manual_sell_ticker
     price_hist = {}
     entry_times = {}
     highest_prices = {}
@@ -391,11 +549,14 @@ def main_loop():
                     continue
 
                 resp = client.get_positions()
-                all_pos = (getattr(resp, 'market_positions', []) or []) + (getattr(resp, 'event_positions', []) or [])
+                # Only use market_positions for tracking - event_positions have different ticker format
+                all_pos = getattr(resp, 'market_positions', []) or []
                 now = time.time()
                 
                 for pos in all_pos:
                     shares = abs(int(getattr(pos, 'position', 0)))
+                    
+                    # Skip closed positions
                     if shares <= 0:
                         continue
                     
@@ -405,10 +566,6 @@ def main_loop():
                     yes_ask = float(getattr(market, 'yes_ask_dollars', current))
                     cost = getattr(pos, 'market_exposure', getattr(pos, 'total_cost', 0))
                     entry = (cost / shares / 100) if shares > 0 else 0  # cost is in cents
-                    
-                    # Market liquidity filter
-                    if not is_market_liquid(market, current, yes_ask):
-                        continue
                     
                     # Initialize tracking
                     if ticker not in price_hist:
@@ -437,17 +594,28 @@ def main_loop():
                     # Log new position
                     position_key = f"{ticker}_{shares}"
                     if position_key not in known_positions:
-                        # Check if market is active for new entries
-                        if is_market_active_for_entry(market):
+                        # Only log as "new" if meets entry criteria, but still track it
+                        if is_market_active_for_entry(market) and is_market_liquid(market, current, yes_ask):
                             known_positions[position_key] = True
                             log_new_position(ticker, market.title, entry, shares)
                         else:
-                            continue  # Skip this position if too close to market close
+                            # Mark as known to prevent re-logging, even if doesn't meet entry criteria
+                            known_positions[position_key] = True
                     
                     # Median reversion sell logic
                     sold = False
                     reason = None
-                    if position_key not in sold_positions and dev_pct >= dynamic_threshold and pnl > 0:
+                    
+                    # Manual sell override
+                    if manual_sell_requested and position_key not in sold_positions:
+                        reason = "Manual sell triggered"
+                        if execute_order(ticker, shares, reason, action="sell"):
+                            log_trade(ticker, market.title, entry, current, pnl, reason)
+                            sold_positions.add(position_key)
+                            sold = True
+                    
+                    # Automatic median reversion sell logic (if not manually sold)
+                    if not sold and position_key not in sold_positions and dev_pct >= dynamic_threshold and pnl > 0:
                         reason = f"Median reversion +{dynamic_threshold:.2f}% deviation"
                         if execute_order(ticker, shares, reason, action="sell"):
                             log_trade(ticker, market.title, entry, current, pnl, reason)
@@ -496,17 +664,31 @@ def main_loop():
 
                 rows = sorted(rows, key=lambda x: x['pnl'], reverse=True)
                 live.update(generate_dashboard(rows))
+                
+                # Reset manual sell flag after processing
+                if manual_sell_requested:
+                    manual_sell_requested = False
+                
                 time.sleep(REFRESH_RATE)
 
             except KeyboardInterrupt:
                 console.print("[yellow]Stopped by user[/yellow]")
                 break
             except Exception as e:
-                console.print(f"[red]Error: {e}[/red]")
-                time.sleep(3)
+                # Log error silently to avoid disrupting Live display
+                import traceback
+                with open("error.log", "a") as f:
+                    f.write(f"{datetime.datetime.now()} - Error: {str(e)}\n")
+                    f.write(traceback.format_exc() + "\n")
+                time.sleep(1)
 
 
 if __name__ == "__main__":
     console.print("[cyan]Starting Median Regression Bot[/cyan]")
     console.print(f"[dim]Strategy: Median window={ROLLING_WINDOW}, threshold={DEVIATION_THRESHOLD_PCT}%[/dim]")
+    
+    # Start input listener thread
+    input_thread = threading.Thread(target=listen_for_input, daemon=True)
+    input_thread.start()
+    
     main_loop()
